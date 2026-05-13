@@ -1,0 +1,7 @@
+pandas
+numpy
+underthesea
+tqdm
+ipykernel
+streamlit
+matplotlib
