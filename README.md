@@ -1,38 +1,3 @@
-BTL/
-│
-├── data/
-│   ├── raw/
-│   │   └── vietnamese_online_news.json
-│   │
-│   └── processed/
-│       └── news_processed.pkl
-│
-├── notebooks/
-│   ├── 01_preprocessing.ipynb
-│   ├── 02_tfidf_manual.ipynb
-│   ├── 03_bm25_manual.ipynb
-│   ├── 04_hybrid_rrf.ipynb
-│   └── 05_evaluation.ipynb
-│
-├── app/
-│   └── app.py
-│
-├── models/
-│   ├── tfidf_index.pkl
-│   ├── bm25_index.pkl
-│   └── metadata.pkl
-│
-├── outputs/
-│   ├── relevance_judgments_template.csv
-│   ├── relevance_judgments_filled.csv
-│   ├── evaluation_detail.csv
-│   └── evaluation_summary.csv
-│
-├── requirements.txt
-├── README.md
-└── .gitignore
-
-
 ## Tạo môi trường ảo
 python -m venv .venv
 

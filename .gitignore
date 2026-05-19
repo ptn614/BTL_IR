@@ -22,7 +22,10 @@ data/raw/
 data/processed/
 
 # Model/index files
-models/*.pkl
+models/**/*.pkl
+models/**/*.joblib
+models/**/*.npy
+models/**/*.npz
 
 # Output files
 outputs/
