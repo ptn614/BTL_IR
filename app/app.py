@@ -1,509 +1,632 @@
-"""
-Vietnamese News Search — Streamlit App
-
-Run from project root:
-    streamlit run app/app.py
-
-Required files:
-    models/tfidf_index.pkl
-    models/bm25_index.pkl
-    models/metadata.pkl
-"""
-
-import os
-import re
+import sys
 import math
 import pickle
-from collections import Counter
+from pathlib import Path
+from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from underthesea import word_tokenize
+
+from scipy.sparse import csr_matrix
+from sklearn.preprocessing import normalize
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-# ─── PATHS ───────────────────────────────────────────────────────────────────
+# =========================================================
+# 1. PATH CONFIG
+# =========================================================
 
-BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TFIDF_PATH  = os.path.join(BASE_DIR, "models", "tfidf_index.pkl")
-BM25_PATH   = os.path.join(BASE_DIR, "models", "bm25_index.pkl")
-META_PATH   = os.path.join(BASE_DIR, "models", "metadata.pkl")
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from src.preprocess import preprocess_query
 
 
-# ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
+TFIDF_DIR = PROJECT_ROOT / "models" / "tfidf_rocchio"
+LSI_DIR = PROJECT_ROOT / "models" / "lsi_svd"
+BM25_DIR = PROJECT_ROOT / "models" / "bm25_query_expansion"
+
+
+# =========================================================
+# 2. LOAD PICKLE HELPER
+# =========================================================
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# =========================================================
+# 3. LAZY LOAD MODEL BY METHOD
+# =========================================================
+
+@st.cache_resource(show_spinner="Đang load TF-IDF / TF-IDF + Rocchio...")
+def load_tfidf_model():
+    return {
+        "vocab": load_pickle(TFIDF_DIR / "vocab.pkl"),
+        "idf": load_pickle(TFIDF_DIR / "idf.pkl"),
+        "tfidf_matrix": load_pickle(TFIDF_DIR / "tfidf_matrix.pkl"),
+        "metadata": load_pickle(TFIDF_DIR / "metadata.pkl"),
+    }
+
+
+@st.cache_resource(show_spinner="Đang load LSI / SVD...")
+def load_lsi_model():
+    return {
+        "vocab": load_pickle(LSI_DIR / "vocab.pkl"),
+        "idf": load_pickle(LSI_DIR / "idf.pkl"),
+        "svd_model": load_pickle(LSI_DIR / "svd_model.pkl"),
+        "lsi_doc_matrix": load_pickle(LSI_DIR / "lsi_doc_matrix.pkl"),
+        "metadata": load_pickle(LSI_DIR / "metadata.pkl"),
+    }
+
+
+@st.cache_resource(show_spinner="Đang load BM25 / BM25 + Query Expansion...")
+def load_bm25_model():
+    return {
+        "bm25_idf": load_pickle(BM25_DIR / "bm25_idf.pkl"),
+        "inverted_index": load_pickle(BM25_DIR / "inverted_index.pkl"),
+        "doc_lengths": load_pickle(BM25_DIR / "doc_lengths.pkl"),
+        "avg_doc_length": load_pickle(BM25_DIR / "avg_doc_length.pkl"),
+        "metadata": load_pickle(BM25_DIR / "metadata.pkl"),
+    }
+
+
+# =========================================================
+# 4. COMMON: QUERY TO TF-IDF VECTOR
+# =========================================================
+
+def query_to_tfidf(query_tokens, vocab, idf):
+    token_counts = Counter(query_tokens)
+
+    rows = []
+    cols = []
+    values = []
+
+    for token, count in token_counts.items():
+        if token in vocab:
+            col_idx = vocab[token]
+
+            tf = 1 + math.log(count)
+            tfidf_value = tf * idf[col_idx]
+
+            rows.append(0)
+            cols.append(col_idx)
+            values.append(tfidf_value)
+
+    query_vector = csr_matrix(
+        (values, (rows, cols)),
+        shape=(1, len(vocab)),
+        dtype=np.float32
+    )
+
+    query_vector = normalize(query_vector, norm="l2", axis=1)
+
+    return query_vector
+
+
+# =========================================================
+# 5. SEARCH: TF-IDF
+# =========================================================
+
+def search_tfidf(query, tfidf_model, top_k=10):
+    query_processed, query_tokens = preprocess_query(query)
+
+    query_tfidf = query_to_tfidf(
+        query_tokens=query_tokens,
+        vocab=tfidf_model["vocab"],
+        idf=tfidf_model["idf"]
+    )
+
+    scores = cosine_similarity(
+        query_tfidf,
+        tfidf_model["tfidf_matrix"]
+    ).flatten()
+
+    top_indices = scores.argsort()[::-1][:top_k]
+
+    results = tfidf_model["metadata"].iloc[top_indices].copy()
+    results["score"] = scores[top_indices]
+    results["query_processed"] = query_processed
+    results["method"] = "TF-IDF"
+
+    return results
+
+
+# =========================================================
+# 6. SEARCH: TF-IDF + ROCCHIO
+# =========================================================
+
+def search_tfidf_rocchio(
+    query,
+    tfidf_model,
+    top_k=10,
+    feedback_k=5,
+    alpha=1.0,
+    beta=0.75
+):
+    query_processed, query_tokens = preprocess_query(query)
+
+    query_tfidf = query_to_tfidf(
+        query_tokens=query_tokens,
+        vocab=tfidf_model["vocab"],
+        idf=tfidf_model["idf"]
+    )
+
+    first_scores = cosine_similarity(
+        query_tfidf,
+        tfidf_model["tfidf_matrix"]
+    ).flatten()
+
+    pseudo_relevant_indices = first_scores.argsort()[::-1][:feedback_k]
+
+    relevant_docs_vector = tfidf_model["tfidf_matrix"][pseudo_relevant_indices]
+    relevant_centroid = relevant_docs_vector.mean(axis=0)
+
+    query_rocchio = alpha * query_tfidf + beta * csr_matrix(relevant_centroid)
+    query_rocchio = normalize(query_rocchio, norm="l2", axis=1)
+
+    scores = cosine_similarity(
+        query_rocchio,
+        tfidf_model["tfidf_matrix"]
+    ).flatten()
+
+    top_indices = scores.argsort()[::-1][:top_k]
+
+    results = tfidf_model["metadata"].iloc[top_indices].copy()
+    results["score"] = scores[top_indices]
+    results["query_processed"] = query_processed
+    results["method"] = "TF-IDF + Rocchio"
+
+    return results
+
+
+# =========================================================
+# 7. SEARCH: LSI / SVD
+# =========================================================
+
+def search_lsi(query, lsi_model, top_k=10):
+    query_processed, query_tokens = preprocess_query(query)
+
+    query_tfidf = query_to_tfidf(
+        query_tokens=query_tokens,
+        vocab=lsi_model["vocab"],
+        idf=lsi_model["idf"]
+    )
+
+    query_lsi = lsi_model["svd_model"].transform(query_tfidf)
+    query_lsi = normalize(query_lsi, norm="l2")
+
+    scores = cosine_similarity(
+        query_lsi,
+        lsi_model["lsi_doc_matrix"]
+    ).flatten()
+
+    top_indices = scores.argsort()[::-1][:top_k]
+
+    results = lsi_model["metadata"].iloc[top_indices].copy()
+    results["score"] = scores[top_indices]
+    results["query_processed"] = query_processed
+    results["method"] = "LSI / SVD"
+
+    return results
+
+
+# =========================================================
+# 8. SEARCH: BM25
+# =========================================================
+
+def iter_posting_items(posting):
+    """
+    Hỗ trợ 2 dạng inverted index:
+    1. token -> {doc_idx: tf}
+    2. token -> [(doc_idx, tf), ...]
+    """
+    if isinstance(posting, dict):
+        return posting.items()
+
+    return posting
+
+
+def bm25_score(query_tokens, bm25_model, k1=1.5, b=0.75):
+    scores = defaultdict(float)
+
+    bm25_idf = bm25_model["bm25_idf"]
+    inverted_index = bm25_model["inverted_index"]
+    doc_lengths = bm25_model["doc_lengths"]
+    avg_doc_length = bm25_model["avg_doc_length"]
+
+    for token in query_tokens:
+        if token not in inverted_index:
+            continue
+
+        idf = bm25_idf.get(token, 0.0)
+        posting = inverted_index[token]
+
+        for doc_idx, tf in iter_posting_items(posting):
+            dl = doc_lengths[doc_idx]
+
+            numerator = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * dl / avg_doc_length)
+
+            scores[doc_idx] += idf * numerator / denominator
+
+    return scores
+
+
+def search_bm25(query, bm25_model, top_k=10):
+    query_processed, query_tokens = preprocess_query(query)
+
+    scores = bm25_score(query_tokens, bm25_model)
+
+    if len(scores) == 0:
+        return pd.DataFrame()
+
+    ranked = sorted(
+        scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:top_k]
+
+    top_indices = [doc_idx for doc_idx, _ in ranked]
+    top_scores = [score for _, score in ranked]
+
+    results = bm25_model["metadata"].iloc[top_indices].copy()
+    results["score"] = top_scores
+    results["query_processed"] = query_processed
+    results["method"] = "BM25"
+
+    return results
+
+
+# =========================================================
+# 9. SEARCH: BM25 + QUERY EXPANSION
+# =========================================================
+
+def get_expansion_terms(query_tokens, top_doc_indices, bm25_model, expand_n=5):
+    query_token_set = set(query_tokens)
+
+    inverted_index = bm25_model["inverted_index"]
+    bm25_idf = bm25_model["bm25_idf"]
+
+    candidate_scores = defaultdict(float)
+    top_doc_set = set(top_doc_indices)
+
+    for token, posting in inverted_index.items():
+        if token in query_token_set:
+            continue
+
+        score = 0.0
+
+        for doc_idx, tf in iter_posting_items(posting):
+            if doc_idx in top_doc_set:
+                score += tf * bm25_idf.get(token, 0.0)
+
+        if score > 0:
+            candidate_scores[token] = score
+
+    sorted_terms = sorted(
+        candidate_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    expansion_terms = [token for token, _ in sorted_terms[:expand_n]]
+
+    return expansion_terms
+
+
+def search_bm25_query_expansion(
+    query,
+    bm25_model,
+    top_k=10,
+    feedback_k=5,
+    expand_n=5
+):
+    query_processed, query_tokens = preprocess_query(query)
+
+    first_scores = bm25_score(query_tokens, bm25_model)
+
+    if len(first_scores) == 0:
+        return pd.DataFrame()
+
+    first_ranked = sorted(
+        first_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:feedback_k]
+
+    top_doc_indices = [doc_idx for doc_idx, _ in first_ranked]
+
+    expansion_terms = get_expansion_terms(
+        query_tokens=query_tokens,
+        top_doc_indices=top_doc_indices,
+        bm25_model=bm25_model,
+        expand_n=expand_n
+    )
+
+    expanded_query_tokens = query_tokens + expansion_terms
+    expanded_query = " ".join(expanded_query_tokens)
+
+    second_scores = bm25_score(expanded_query_tokens, bm25_model)
+
+    second_ranked = sorted(
+        second_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:top_k]
+
+    top_indices = [doc_idx for doc_idx, _ in second_ranked]
+    top_scores = [score for _, score in second_ranked]
+
+    results = bm25_model["metadata"].iloc[top_indices].copy()
+    results["score"] = top_scores
+    results["query_processed"] = query_processed
+    results["expanded_query"] = expanded_query
+    results["expansion_terms"] = ", ".join(expansion_terms)
+    results["method"] = "BM25 + Query Expansion"
+
+    return results
+
+
+# =========================================================
+# 10. UI HELPER
+# =========================================================
+
+def safe_get(row, col, default=""):
+    if col in row and pd.notna(row[col]):
+        return row[col]
+
+    return default
+
+
+def render_results(results):
+    if results is None or len(results) == 0:
+        st.warning("Không tìm thấy kết quả phù hợp.")
+        return
+
+    for rank, (_, row) in enumerate(results.iterrows(), start=1):
+        title = str(safe_get(row, "title", "Không có tiêu đề"))
+        url = str(safe_get(row, "url", ""))
+        score = safe_get(row, "score", 0)
+
+        if url and url != "nan":
+            title_html = f'<a href="{url}" target="_blank">{title}</a>'
+        else:
+            title_html = title
+
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="rank">#{rank}</div>
+                <div class="title">{title_html}</div>
+                <div class="meta"><b>Score:</b> {float(score):.4f}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# =========================================================
+# 11. STREAMLIT UI
+# =========================================================
 
 st.set_page_config(
-    page_title="Tìm kiếm tin tức",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="collapsed",
+    page_title="Vietnamese News Retrieval",
+    page_icon="🔎",
+    layout="wide"
+)
+
+st.markdown(
+    """
+    <style>
+        .main {
+            background-color: #f8fafc;
+        }
+
+        .app-title {
+            font-size: 36px;
+            font-weight: 800;
+            color: #0f172a;
+            margin-bottom: 4px;
+        }
+
+        .app-subtitle {
+            font-size: 16px;
+            color: #475569;
+            margin-bottom: 24px;
+        }
+
+        .result-card {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
+        }
+
+        .rank {
+            display: inline-block;
+            background: #e0f2fe;
+            color: #0369a1;
+            font-weight: 700;
+            padding: 4px 10px;
+            border-radius: 999px;
+            margin-bottom: 8px;
+        }
+
+        .title {
+            font-size: 19px;
+            font-weight: 750;
+            color: #0f172a;
+            margin-top: 6px;
+            margin-bottom: 8px;
+        }
+
+        .title a {
+            color: #0f172a;
+            text-decoration: none;
+        }
+
+        .title a:hover {
+            color: #0284c7;
+            text-decoration: underline;
+        }
+
+        .meta {
+            color: #64748b;
+            font-size: 14px;
+            margin-top: 6px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="app-title">🔎 Vietnamese News Retrieval System</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="app-subtitle">Truy xuất tin tức tiếng Việt bằng TF-IDF, Rocchio, LSI/SVD và BM25</div>',
+    unsafe_allow_html=True
 )
 
 
-# ─── GLOBAL STYLES ───────────────────────────────────────────────────────────
+# =========================================================
+# 12. SIDEBAR CONFIG
+# =========================================================
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
+with st.sidebar:
+    st.header("⚙️ Cấu hình tìm kiếm")
 
-*, *::before, *::after { box-sizing: border-box; }
-
-html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-}
-
-/* Remove default streamlit chrome */
-#MainMenu, footer, header { visibility: hidden; }
-.block-container {
-    padding: 3rem 3rem 4rem;
-    max-width: 860px;
-    margin: 0 auto;
-}
-
-/* ── Typography ── */
-h1.page-title {
-    font-size: 28px;
-    font-weight: 600;
-    color: #0f172a;
-    margin: 0 0 4px;
-    letter-spacing: -0.02em;
-}
-p.page-sub {
-    font-size: 14px;
-    color: #64748b;
-    margin: 0 0 32px;
-}
-
-/* ── Search bar ── */
-.search-row {
-    display: flex;
-    gap: 10px;
-    align-items: flex-start;
-    margin-bottom: 12px;
-}
-
-/* ── Method select pill group ── */
-.pill-group {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 28px;
-    flex-wrap: wrap;
-}
-.pill {
-    font-size: 13px;
-    font-weight: 500;
-    padding: 5px 14px;
-    border-radius: 999px;
-    border: 1.5px solid #e2e8f0;
-    background: #fff;
-    color: #475569;
-    cursor: pointer;
-    transition: all 0.15s;
-    white-space: nowrap;
-}
-.pill:hover  { border-color: #94a3b8; color: #0f172a; }
-.pill.active { border-color: #0f172a; background: #0f172a; color: #fff; }
-
-/* ── Stats row ── */
-.stats-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 28px;
-    font-size: 13px;
-    color: #64748b;
-}
-.stat-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 5px 12px;
-    font-size: 13px;
-    color: #475569;
-}
-.stat-chip b { color: #0f172a; font-weight: 600; }
-
-/* ── Divider ── */
-hr.light {
-    border: none;
-    border-top: 1px solid #f1f5f9;
-    margin: 0 0 20px;
-}
-
-/* ── Result card ── */
-.r-card {
-    padding: 20px 0;
-    border-bottom: 1px solid #f1f5f9;
-}
-.r-card:last-child { border-bottom: none; }
-
-.r-rank {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #94a3b8;
-    margin-bottom: 6px;
-}
-.r-title {
-    font-size: 16px;
-    font-weight: 600;
-    color: #0f172a;
-    line-height: 1.45;
-    margin-bottom: 8px;
-}
-.r-link {
-    color: #0f172a !important;
-    text-decoration: none;
-    border-bottom: 1.5px solid #e2e8f0;
-    transition: color 0.15s, border-color 0.15s;
-}
-.r-link:hover {
-    color: #2563eb !important;
-    border-bottom-color: #2563eb;
-}
-
-.r-meta {
-    font-size: 13px;
-    color: #94a3b8;
-    margin-bottom: 8px;
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-}
-.r-meta span { display: inline-flex; align-items: center; gap: 3px; }
-
-.r-scores {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 8px;
-}
-.score-pill {
-    font-family: 'DM Mono', monospace;
-    font-size: 12px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    padding: 3px 10px;
-    color: #475569;
-}
-.score-pill b { color: #334155; }
-
-/* ── Empty state ── */
-.empty-state {
-    text-align: center;
-    padding: 60px 0;
-    color: #94a3b8;
-    font-size: 14px;
-}
-.empty-state .icon { font-size: 32px; margin-bottom: 10px; }
-
-/* ── Processed query chip ── */
-.query-chip {
-    font-family: 'DM Mono', monospace;
-    font-size: 12px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    padding: 8px 14px;
-    color: #475569;
-    margin-bottom: 20px;
-    word-break: break-all;
-}
-
-/* Streamlit widget cleanup */
-div[data-testid="stTextInput"] input {
-    border-radius: 10px !important;
-    border: 1.5px solid #e2e8f0 !important;
-    font-size: 15px !important;
-    height: 44px !important;
-    padding: 0 14px !important;
-    font-family: 'DM Sans', sans-serif !important;
-    transition: border-color 0.15s !important;
-}
-div[data-testid="stTextInput"] input:focus {
-    border-color: #0f172a !important;
-    box-shadow: none !important;
-}
-.stButton > button {
-    border-radius: 10px !important;
-    background: #0f172a !important;
-    color: #fff !important;
-    border: none !important;
-    font-size: 14px !important;
-    font-weight: 600 !important;
-    height: 44px !important;
-    padding: 0 22px !important;
-    font-family: 'DM Sans', sans-serif !important;
-    transition: background 0.15s !important;
-}
-.stButton > button:hover {
-    background: #1e293b !important;
-}
-
-div[data-testid="stSelectbox"] > div {
-    border-radius: 10px !important;
-    border: 1.5px solid #e2e8f0 !important;
-}
-
-div[data-testid="stSidebar"] { display: none; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ─── LOAD INDEXES ────────────────────────────────────────────────────────────
-
-@st.cache_resource
-def load_indexes():
-    paths = [TFIDF_PATH, BM25_PATH, META_PATH]
-    missing = [p for p in paths if not os.path.exists(p)]
-    if missing:
-        return None, None, None, missing
-
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf = pickle.load(f)
-    with open(BM25_PATH, "rb") as f:
-        bm25 = pickle.load(f)
-    meta = pd.read_pickle(META_PATH)
-    return tfidf, bm25, meta, []
-
-
-tfidf_index, bm25_index, metadata_df, missing_files = load_indexes()
-
-if missing_files:
-    st.error("Thiếu file index. Vui lòng chạy các notebook theo thứ tự:")
-    st.code("1. notebooks/01_preprocessing.ipynb\n2. notebooks/02_tfidf_manual.ipynb\n3. notebooks/03_bm25_manual.ipynb", language="text")
-    for p in missing_files:
-        st.code(p)
-    st.stop()
-
-idf            = tfidf_index["idf"]
-tfidf_docs     = tfidf_index["tfidf_docs"]
-bm25_idf       = bm25_index["bm25_idf"]
-doc_term_freqs = bm25_index["doc_term_freqs"]
-doc_lengths    = bm25_index["doc_lengths"]
-avg_doc_length = bm25_index["avg_doc_length"]
-N              = bm25_index["N"]
-df             = metadata_df.copy()
-
-
-# ─── PREPROCESSING ────────────────────────────────────────────────────────────
-
-STOPWORDS = {
-    "là","và","của","có","cho","với","trong","khi","những","các",
-    "một","được","đã","đang","này","đó","thì","mà","ở","về","từ",
-    "đến","theo","sau","trước","trên","dưới","vào","ra","năm",
-    "ngày","tháng","cũng","như","nếu","vì","do","để","bị","tại",
-    "nên","sẽ","rằng","nhiều"
-}
-
-def clean_text(text):
-    text = str(text).lower()
-    text = re.sub(r"http\S+|www\S+", " ", text)
-    text = re.sub(r"[^a-zA-ZÀ-ỹ0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-def preprocess(text):
-    text = clean_text(text)
-    text = word_tokenize(text, format="text")
-    return " ".join(t for t in text.split() if t not in STOPWORDS)
-
-
-# ─── SCORING ─────────────────────────────────────────────────────────────────
-
-def query_tfidf_vec(query):
-    tokens = preprocess(query).split()
-    counts = Counter(tokens)
-    n = len(tokens)
-    return {t: (c/n)*idf[t] for t, c in counts.items() if t in idf} if n else {}
-
-def cosine(v1, v2):
-    common = set(v1) & set(v2)
-    num    = sum(v1[t]*v2[t] for t in common)
-    d1     = math.sqrt(sum(x**2 for x in v1.values()))
-    d2     = math.sqrt(sum(x**2 for x in v2.values()))
-    return num / (d1*d2) if d1 and d2 else 0.0
-
-def tfidf_scores(query):
-    qv = query_tfidf_vec(query)
-    return np.array([cosine(qv, dv) for dv in tfidf_docs])
-
-def bm25_scores(query, k1=1.5, b=0.75):
-    tokens = preprocess(query).split()
-    scores = []
-    for i in range(N):
-        s, tf_map, dl = 0.0, doc_term_freqs[i], doc_lengths[i]
-        for t in tokens:
-            if t not in bm25_idf: continue
-            tf  = tf_map.get(t, 0)
-            num = tf * (k1 + 1)
-            den = tf + k1 * (1 - b + b * dl / avg_doc_length)
-            if den: s += bm25_idf[t] * num / den
-        scores.append(s)
-    return np.array(scores)
-
-
-# ─── SEARCH ──────────────────────────────────────────────────────────────────
-
-def search(query, method, top_k=10, rrf_k=60):
-    ts = tfidf_scores(query)
-    bs = bm25_scores(query)
-
-    if method == "TF-IDF":
-        idx = ts.argsort()[::-1][:top_k]
-        res = df.iloc[idx].copy()
-        res["score"] = ts[idx]
-
-    elif method == "BM25":
-        idx = bs.argsort()[::-1][:top_k]
-        res = df.iloc[idx].copy()
-        res["score"] = bs[idx]
-
-    else:  # Hybrid RRF
-        tr, br  = ts.argsort()[::-1], bs.argsort()[::-1]
-        rrf     = np.zeros(N)
-        for r, i in enumerate(tr): rrf[i] += 1/(rrf_k+r+1)
-        for r, i in enumerate(br): rrf[i] += 1/(rrf_k+r+1)
-        idx = rrf.argsort()[::-1][:top_k]
-        res = df.iloc[idx].copy()
-        res["score"]       = rrf[idx]
-        res["tfidf_score"] = ts[idx]
-        res["bm25_score"]  = bs[idx]
-
-    res["rank"] = range(1, len(res)+1)
-    return res
-
-
-# ─── SESSION STATE ────────────────────────────────────────────────────────────
-
-if "method" not in st.session_state:
-    st.session_state["method"] = "Hybrid RRF"
-if "results" not in st.session_state:
-    st.session_state["results"] = None
-if "proc_query" not in st.session_state:
-    st.session_state["proc_query"] = ""
-
-
-# ─── HEADER ──────────────────────────────────────────────────────────────────
-
-st.markdown('<h1 class="page-title">Tìm kiếm tin tức tiếng Việt</h1>', unsafe_allow_html=True)
-st.markdown('<p class="page-sub">TF-IDF · BM25 · Hybrid RRF</p>', unsafe_allow_html=True)
-
-
-# ─── SEARCH INPUT ────────────────────────────────────────────────────────────
-
-col_q, col_btn = st.columns([5, 1])
-with col_q:
-    query = st.text_input(
-        label="query",
-        label_visibility="collapsed",
-        placeholder="Nhập từ khoá… vd: giá xăng tăng, bóng đá Việt Nam",
-        key="query_input",
+    method = st.selectbox(
+        "Chọn phương pháp",
+        [
+            "TF-IDF",
+            "TF-IDF + Rocchio",
+            "LSI / SVD",
+            "BM25",
+            "BM25 + Query Expansion"
+        ]
     )
-with col_btn:
-    search_clicked = st.button("Tìm", use_container_width=True)
+
+    top_k = st.slider("Số kết quả Top-K", 5, 30, 10)
+
+    if method in ["TF-IDF + Rocchio", "BM25 + Query Expansion"]:
+        st.divider()
+        feedback_k = st.slider("Feedback K / Top documents", 3, 20, 5)
+    else:
+        feedback_k = 5
+
+    if method == "BM25 + Query Expansion":
+        expand_n = st.slider("Số từ mở rộng BM25", 1, 10, 5)
+    else:
+        expand_n = 5
+
+    st.caption("App chỉ load model của phương pháp được chọn khi bấm tìm kiếm.")
 
 
-# ─── METHOD SELECTOR (dropdown) ──────────────────────────────────────────────
-
-method = st.selectbox(
-    label="Phương pháp",
-    options=["Hybrid RRF", "BM25", "TF-IDF"],
-    index=["Hybrid RRF","BM25","TF-IDF"].index(st.session_state["method"]),
-    key="method_select",
-    label_visibility="visible",
+query = st.text_input(
+    "Nhập câu truy vấn",
+    value="cầu thủ Quang Hải",
+    placeholder="Ví dụ: giá xăng tăng mạnh, chứng khoán giảm điểm, bóng đá Việt Nam..."
 )
-st.session_state["method"] = method
 
-# Dataset stats chips
-stats_html = f"""
-<div class="stats-row">
-  <span class="stat-chip">📄 <b>{N:,}</b> bài báo</span>
-"""
-if "topic" in df.columns:
-    stats_html += f'<span class="stat-chip">🗂 <b>{df["topic"].nunique()}</b> chủ đề</span>'
-if "source" in df.columns:
-    stats_html += f'<span class="stat-chip">📰 <b>{df["source"].nunique()}</b> nguồn</span>'
-stats_html += "</div>"
-st.markdown(stats_html, unsafe_allow_html=True)
+search_clicked = st.button("Tìm kiếm", type="primary")
 
 
-# ─── SEARCH ACTION ────────────────────────────────────────────────────────────
+# =========================================================
+# 13. SEARCH ACTION
+# =========================================================
 
 if search_clicked:
-    if not query.strip():
-        st.warning("Vui lòng nhập từ khoá.")
+    if query.strip() == "":
+        st.warning("Vui lòng nhập câu truy vấn.")
     else:
-        with st.spinner("Đang tìm kiếm…"):
-            st.session_state["proc_query"] = preprocess(query)
-            st.session_state["results"]    = search(query, method)
+        query_processed, query_tokens = preprocess_query(query)
 
+        st.markdown("### Query")
 
-# ─── RESULTS ──────────────────────────────────────────────────────────────────
+        col1, col2 = st.columns(2)
 
-results = st.session_state["results"]
+        with col1:
+            st.info(f"**Query gốc:** {query}")
 
-if results is None:
-    st.markdown("""
-    <div class="empty-state">
-        <div class="icon">🔍</div>
-        Nhập từ khoá và bấm <b>Tìm</b> để bắt đầu.
-    </div>
-    """, unsafe_allow_html=True)
+        with col2:
+            st.success(f"**Query sau xử lý:** {query_processed}")
 
-elif results.empty:
-    st.markdown("""
-    <div class="empty-state">
-        <div class="icon">😶</div>
-        Không tìm thấy kết quả phù hợp.
-    </div>
-    """, unsafe_allow_html=True)
+        st.divider()
 
-else:
-    pq = st.session_state["proc_query"]
-    if pq:
-        st.markdown(f'<div class="query-chip">🔤 {pq}</div>', unsafe_allow_html=True)
+        if method == "TF-IDF":
+            tfidf_model = load_tfidf_model()
 
-    st.markdown(
-        f"**{len(results)}** kết quả &nbsp;·&nbsp; phương pháp: **{method}**",
-        unsafe_allow_html=False,
-    )
-    st.markdown('<hr class="light">', unsafe_allow_html=True)
-
-    for _, row in results.iterrows():
-        rank  = int(row.get("rank", 0))
-        title = row.get("title", "—")
-        url   = row.get("url", "")
-        score = float(row.get("score", 0))
-
-        has_url = isinstance(url, str) and url.strip()
-
-        # Score pills
-        if method == "Hybrid RRF":
-            ts_ = float(row.get("tfidf_score", 0))
-            bs_ = float(row.get("bm25_score",  0))
-            pills = (
-                f'<span class="score-pill"><b>RRF</b>&nbsp;{score:.6f}</span>'
-                f'<span class="score-pill"><b>TF-IDF</b>&nbsp;{ts_:.6f}</span>'
-                f'<span class="score-pill"><b>BM25</b>&nbsp;{bs_:.4f}</span>'
+            results = search_tfidf(
+                query=query,
+                tfidf_model=tfidf_model,
+                top_k=top_k
             )
-        else:
-            pills = f'<span class="score-pill"><b>{method}</b>&nbsp;{score:.6f}</span>'
 
-        # Title: link if url exists
-        if has_url:
-            title_part = f'<a class="r-link" href="{url}" target="_blank">{title}</a>'
-        else:
-            title_part = title
+            st.subheader("Kết quả: TF-IDF")
+            render_results(results)
 
-        html = (
-            f'<div class="r-card">'
-            f'<div class="r-rank">#{rank}</div>'
-            f'<div class="r-title">{title_part}</div>'
-            f'<div class="r-scores">{pills}</div>'
-            f'</div>'
-        )
-        st.markdown(html, unsafe_allow_html=True)
+        elif method == "TF-IDF + Rocchio":
+            tfidf_model = load_tfidf_model()
+
+            results = search_tfidf_rocchio(
+                query=query,
+                tfidf_model=tfidf_model,
+                top_k=top_k,
+                feedback_k=feedback_k
+            )
+
+            st.subheader("Kết quả: TF-IDF + Rocchio")
+            render_results(results)
+
+        elif method == "LSI / SVD":
+            lsi_model = load_lsi_model()
+
+            results = search_lsi(
+                query=query,
+                lsi_model=lsi_model,
+                top_k=top_k
+            )
+
+            st.subheader("Kết quả: LSI / SVD")
+            render_results(results)
+
+        elif method == "BM25":
+            bm25_model = load_bm25_model()
+
+            results = search_bm25(
+                query=query,
+                bm25_model=bm25_model,
+                top_k=top_k
+            )
+
+            st.subheader("Kết quả: BM25")
+            render_results(results)
+
+        elif method == "BM25 + Query Expansion":
+            bm25_model = load_bm25_model()
+
+            results = search_bm25_query_expansion(
+                query=query,
+                bm25_model=bm25_model,
+                top_k=top_k,
+                feedback_k=feedback_k,
+                expand_n=expand_n
+            )
+
+            st.subheader("Kết quả: BM25 + Query Expansion")
+
+            if len(results) > 0 and "expanded_query" in results.columns:
+                st.warning(f"**Query mở rộng:** {results['expanded_query'].iloc[0]}")
+
+            render_results(results)
