@@ -20,6 +20,7 @@ Thumbs.db
 # Large data files
 data/raw/
 data/processed/
+data/evaluation/*csv
 
 # Model/index files
 models/**/*.pkl
